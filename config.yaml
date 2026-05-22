@@ -1,3 +1,5 @@
+log_level: "info"
+
 server:
   port: ":8080"
   backends:
@@ -11,3 +13,9 @@ ratelimit:
 
 encryption:
   key: "0123456789abcdef0123456789abcdef"
+
+cluster:
+  node_name: "aeroproxy-node-1"
+  bind_addr: "0.0.0.0"
+  bind_port: 7946
+  join_address: ""

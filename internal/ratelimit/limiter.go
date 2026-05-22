@@ -19,19 +19,72 @@ type TokenBucket struct {
 
 // RateLimiter manages the token buckets for all client IPs.
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*TokenBucket
-	rate     float64
-	capacity float64
+	mu           sync.RWMutex
+	buckets      map[string]*TokenBucket
+	blockedUntil map[string]time.Time
+	rate         float64
+	capacity     float64
+	broadcastFn  func(ip string, blockedUntil time.Time)
 }
 
 // NewRateLimiter creates a new RateLimiter instance.
 func NewRateLimiter(rate, capacity float64) *RateLimiter {
 	return &RateLimiter{
-		buckets:  make(map[string]*TokenBucket),
-		rate:     rate,
-		capacity: capacity,
+		buckets:      make(map[string]*TokenBucket),
+		blockedUntil: make(map[string]time.Time),
+		rate:         rate,
+		capacity:     capacity,
 	}
+}
+
+// SetBroadcastCallback registers the function to call when an IP is blocked.
+func (rl *RateLimiter) SetBroadcastCallback(fn func(ip string, blockedUntil time.Time)) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.broadcastFn = fn
+}
+
+// BlockIP records an IP block from the gossip network.
+func (rl *RateLimiter) BlockIP(ip string, blockedUntil time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.blockedUntil == nil {
+		rl.blockedUntil = make(map[string]time.Time)
+	}
+	if current, exists := rl.blockedUntil[ip]; !exists || blockedUntil.After(current) {
+		rl.blockedUntil[ip] = blockedUntil
+	}
+}
+
+// MergeBlocks merges a map of remote active IP blocks.
+func (rl *RateLimiter) MergeBlocks(blocks map[string]time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.blockedUntil == nil {
+		rl.blockedUntil = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for ip, until := range blocks {
+		if now.Before(until) {
+			if current, exists := rl.blockedUntil[ip]; !exists || until.After(current) {
+				rl.blockedUntil[ip] = until
+			}
+		}
+	}
+}
+
+// GetActiveBlocks returns a map of all currently active IP blocks.
+func (rl *RateLimiter) GetActiveBlocks() map[string]time.Time {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+	active := make(map[string]time.Time)
+	now := time.Now()
+	for ip, until := range rl.blockedUntil {
+		if now.Before(until) {
+			active[ip] = until
+		}
+	}
+	return active
 }
 
 // Allow checks if the request from the given IP address is allowed.
@@ -40,8 +93,12 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	bucket, exists := rl.buckets[ip]
 	now := time.Now()
+	if until, blocked := rl.blockedUntil[ip]; blocked && now.Before(until) {
+		return false
+	}
+
+	bucket, exists := rl.buckets[ip]
 	if !exists {
 		bucket = &TokenBucket{
 			capacity:   rl.capacity,
@@ -66,6 +123,20 @@ func (rl *RateLimiter) Allow(ip string) bool {
 		bucket.tokens -= 1.0
 		return true
 	}
+
+	// Rate limit hit: block the IP locally for 5 seconds
+	blockedUntil := now.Add(5 * time.Second)
+	if rl.blockedUntil == nil {
+		rl.blockedUntil = make(map[string]time.Time)
+	}
+	rl.blockedUntil[ip] = blockedUntil
+
+	// Trigger broadcast callback asynchronously
+	if rl.broadcastFn != nil {
+		fn := rl.broadcastFn
+		go fn(ip, blockedUntil)
+	}
+
 	return false
 }
 

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ManiSaiTeja2007/aeroproxy/internal/cluster"
+	"github.com/ManiSaiTeja2007/aeroproxy/internal/discovery"
 	"github.com/ManiSaiTeja2007/aeroproxy/internal/health"
 	"github.com/ManiSaiTeja2007/aeroproxy/internal/logger"
 	"github.com/ManiSaiTeja2007/aeroproxy/internal/pipeline"
@@ -78,6 +80,13 @@ func TestIntegration(t *testing.T) {
 			req.Host = b.URL.Host
 		}
 		b.ReverseProxy = proxyHandler
+
+		// Inject TrackingTransport
+		proxyHandler.Transport = &proxy.TrackingTransport{
+			Backend:   b,
+			Transport: http.DefaultTransport,
+		}
+
 		pool.AddBackend(b)
 	}
 
@@ -86,7 +95,7 @@ func TestIntegration(t *testing.T) {
 	for attempt := 0; attempt < 5; attempt++ {
 		health.CheckHealthOnce(pool)
 		allAlive := true
-		for _, b := range pool.Backends {
+		for _, b := range pool.GetBackends() {
 			if !b.IsAlive() {
 				allAlive = false
 				break
@@ -107,7 +116,7 @@ func TestIntegration(t *testing.T) {
 	limiter := ratelimit.NewRateLimiter(0.1, 2.0)
 	handler := limiter.Middleware(pool)
 
-	// Test 1: Round Robin routing
+	// Test 1: Predictive routing distribution
 	// Fire 3 requests, each from a unique IP, so we bypass rate limiter capacity limit of 2.
 	clientIPs := []string{"192.168.1.1:1234", "192.168.1.2:1234", "192.168.1.3:1234"}
 	responses := make(map[string]int)
@@ -141,9 +150,8 @@ func TestIntegration(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// Assert that proxy response bodies matches round-robin distribution
 	if responses["server1"] != 1 || responses["server2"] != 1 || responses["server3"] != 1 {
-		t.Errorf("Unexpected round robin response distribution: %v", responses)
+		t.Errorf("Unexpected predictive routing response distribution: %v", responses)
 	}
 
 	// Test 2: Rate Limiting
@@ -214,6 +222,13 @@ func TestEncryptionPipeline(t *testing.T) {
 		req.Host = backend.URL.Host
 	}
 	backend.ReverseProxy = proxyHandler
+
+	// Inject TrackingTransport
+	proxyHandler.Transport = &proxy.TrackingTransport{
+		Backend:   backend,
+		Transport: http.DefaultTransport,
+	}
+
 	pool.AddBackend(backend)
 
 	// Wrap in pipeline DataShifterMiddleware
@@ -273,5 +288,243 @@ func TestEncryptionPipeline(t *testing.T) {
 	// Verify encryption ciphertext has appropriate length
 	if len(cipherBytes) < 28 {
 		t.Errorf("Cipher text length too short: %d bytes", len(cipherBytes))
+	}
+}
+
+func TestCircuitBreaker(t *testing.T) {
+	// Spin up a failing server (returns 500) and a healthy fallback server.
+	var failingHits, healthyHits int
+	var mu sync.Mutex
+
+	failingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		failingHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("failing"))
+	}))
+	defer failingServer.Close()
+
+	healthyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		healthyHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("healthy"))
+	}))
+	defer healthyServer.Close()
+
+	failingURL, _ := url.Parse(failingServer.URL)
+	healthyURL, _ := url.Parse(healthyServer.URL)
+
+	pool := &proxy.ServerPool{}
+
+	// Setup failing backend
+	failingBackend := &proxy.Backend{
+		URL:   failingURL,
+		Alive: true,
+	}
+	failingProxy := httputil.NewSingleHostReverseProxy(failingURL)
+	failingProxy.Director = func(req *http.Request) {
+		req.URL.Scheme = failingURL.Scheme
+		req.URL.Host = failingURL.Host
+		req.Host = failingURL.Host
+	}
+	failingProxy.Transport = &proxy.TrackingTransport{
+		Backend:   failingBackend,
+		Transport: http.DefaultTransport,
+	}
+	failingBackend.ReverseProxy = failingProxy
+	pool.AddBackend(failingBackend)
+
+	// Setup healthy backend
+	healthyBackend := &proxy.Backend{
+		URL:   healthyURL,
+		Alive: true,
+	}
+	healthyProxy := httputil.NewSingleHostReverseProxy(healthyURL)
+	healthyProxy.Director = func(req *http.Request) {
+		req.URL.Scheme = healthyURL.Scheme
+		req.URL.Host = healthyURL.Host
+		req.Host = healthyURL.Host
+	}
+	healthyProxy.Transport = &proxy.TrackingTransport{
+		Backend:   healthyBackend,
+		Transport: http.DefaultTransport,
+	}
+	healthyBackend.ReverseProxy = healthyProxy
+	pool.AddBackend(healthyBackend)
+
+	// Set failingBackend EWMA to a very small non-zero value, and healthyBackend to slightly higher,
+	// so that failingBackend is initially preferred (lower score) until it trips.
+	failingBackend.UpdateEWMA(1.0)
+	healthyBackend.UpdateEWMA(10.0)
+
+	// Fire 3 requests to trip the circuit on failingBackend
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		pool.ServeHTTP(rec, req)
+		res := rec.Result()
+		res.Body.Close()
+
+		if res.StatusCode != http.StatusInternalServerError {
+			t.Errorf("Expected status 500, got %d", res.StatusCode)
+		}
+	}
+
+	mu.Lock()
+	fH := failingHits
+	mu.Unlock()
+	if fH != 3 {
+		t.Fatalf("Expected failing server to be hit 3 times, got %d", fH)
+	}
+
+	// Verify that failingBackend is now tripped (IsHealthy returns false)
+	if failingBackend.IsHealthy() {
+		t.Fatalf("Expected failing backend to be unhealthy/tripped")
+	}
+
+	// Fire a 4th request. Since failingBackend is tripped, it must route to healthyBackend.
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	pool.ServeHTTP(rec, req)
+	res := rec.Result()
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200 from healthy fallback, got %d", res.StatusCode)
+	}
+
+	mu.Lock()
+	hH := healthyHits
+	mu.Unlock()
+	if hH != 1 {
+		t.Errorf("Expected healthy server to be hit once, got %d", hH)
+	}
+}
+
+func TestDynamicDiscovery(t *testing.T) {
+	// Spin up a mock backend server that will be registered dynamically
+	var hitCount int
+	var mu sync.Mutex
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hitCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("dynamic"))
+	}))
+	defer mockServer.Close()
+
+	pool := &proxy.ServerPool{}
+	// Initially pool is empty, so requests should fail with 503
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	pool.ServeHTTP(rec, req)
+	if rec.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("Expected 503 Service Unavailable for empty pool, got %d", rec.Result().StatusCode)
+	}
+
+	// Create the management mux and register discovery API
+	mgmtMux := http.NewServeMux()
+	discovery.RegisterDiscoveryAPI(mgmtMux, pool)
+
+	// Fire POST /backends/add to add the mockServer URL
+	addReqBody := `{"url": "` + mockServer.URL + `"}`
+	addReq := httptest.NewRequest("POST", "/backends/add", bytes.NewBufferString(addReqBody))
+	addReq.Header.Set("Content-Type", "application/json")
+	addRec := httptest.NewRecorder()
+
+	mgmtMux.ServeHTTP(addRec, addReq)
+
+	addRes := addRec.Result()
+	addRes.Body.Close()
+	if addRes.StatusCode != http.StatusCreated {
+		t.Fatalf("Expected status 201 Created from discovery API, got %d", addRes.StatusCode)
+	}
+
+	// Now fire a request to the pool and assert it routes to the dynamically added backend
+	req2 := httptest.NewRequest("GET", "/", nil)
+	rec2 := httptest.NewRecorder()
+	pool.ServeHTTP(rec2, req2)
+
+	res2 := rec2.Result()
+	body, _ := io.ReadAll(res2.Body)
+	res2.Body.Close()
+
+	if res2.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", res2.StatusCode)
+	}
+	if string(body) != "dynamic" {
+		t.Errorf("Expected response body 'dynamic', got %s", string(body))
+	}
+
+	mu.Lock()
+	hits := hitCount
+	mu.Unlock()
+	if hits != 1 {
+		t.Errorf("Expected mock server to receive 1 hit, got %d", hits)
+	}
+}
+
+func TestClusterSync(t *testing.T) {
+	// Initialize two rate limiters (rate=1.0, capacity=2.0)
+	limiterA := ratelimit.NewRateLimiter(1.0, 2.0)
+	limiterB := ratelimit.NewRateLimiter(1.0, 2.0)
+
+		// Set up GossipDelegate for Node B
+	delegateB := &cluster.GossipDelegate{
+		Limiter: limiterB,
+	}
+
+	// Mock GossipService A's broadcast callback to route it directly to Delegate B's NotifyMsg.
+	// This tests the exact workflow: Rate limit triggers on A -> calls broadcast callback ->
+	// marshals state -> Gossip layer delivers -> B's NotifyMsg receives & parses -> B blocks IP.
+	limiterA.SetBroadcastCallback(func(ip string, blockedUntil time.Time) {
+		event := cluster.BlockBroadcast{
+			IP:           ip,
+			BlockedUntil: blockedUntil,
+		}
+		data, err := json.Marshal(&event)
+		if err != nil {
+			t.Errorf("Failed to marshal block event: %v", err)
+			return
+		}
+		delegateB.NotifyMsg(data)
+	})
+
+	testIP := "192.168.200.1"
+
+	// Call Allow 3 times on Limiter A. Capacity is 2.0, so the 3rd should return false and block.
+	if !limiterA.Allow(testIP) {
+		t.Errorf("First call to limiterA should be allowed")
+	}
+	if !limiterA.Allow(testIP) {
+		t.Errorf("Second call to limiterA should be allowed")
+	}
+	if limiterA.Allow(testIP) {
+		t.Errorf("Third call to limiterA should be blocked")
+	}
+
+	// Wait for Node B to receive the blocked state (due to async goroutine callback)
+	var blockedOnB bool
+	for i := 0; i < 50; i++ {
+		blocks := limiterB.GetActiveBlocks()
+		if _, exists := blocks[testIP]; exists {
+			blockedOnB = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !blockedOnB {
+		t.Fatalf("Expected testIP to be blocked on Node B after Gossip sync, but it was not found in active blocks")
+	}
+
+	// Verify Node B returns false on Allow for the blocked IP
+	if limiterB.Allow(testIP) {
+		t.Errorf("Expected Allow to return false for blocked IP on Node B, but it returned true")
 	}
 }

@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"net"
 	"net/url"
 	"strings"
@@ -29,7 +30,19 @@ func getTCPAddress(u *url.URL) string {
 
 // CheckHealthOnce performs a single round of TCP dial checks on all pool backends.
 func CheckHealthOnce(pool *proxy.ServerPool) {
-	for _, backend := range pool.Backends {
+	for _, backend := range pool.GetBackends() {
+		// Detect circuit-breaker state transitions
+		isTripped := backend.IsTripped()
+		wasTripped := backend.GetLastTrippedState()
+		if isTripped != wasTripped {
+			if isTripped {
+				logger.Log.Warn("Circuit Breaker Tripped", zap.String("url", backend.URL.String()))
+			} else {
+				logger.Log.Info("Circuit Breaker Healed", zap.String("url", backend.URL.String()))
+			}
+			backend.SetLastTrippedState(isTripped)
+		}
+
 		addr := getTCPAddress(backend.URL)
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
@@ -48,10 +61,21 @@ func CheckHealthOnce(pool *proxy.ServerPool) {
 	}
 }
 
-// CheckHealth runs an infinite loop checking backend status every 10 seconds.
-func CheckHealth(pool *proxy.ServerPool) {
+// CheckHealth runs a loop checking backend status every 10 seconds until context is cancelled.
+func CheckHealth(ctx context.Context, pool *proxy.ServerPool) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Initial check
+	CheckHealthOnce(pool)
+
 	for {
-		CheckHealthOnce(pool)
-		time.Sleep(10 * time.Second)
+		select {
+		case <-ctx.Done():
+			logger.Log.Info("Health checker loop stopping")
+			return
+		case <-ticker.C:
+			CheckHealthOnce(pool)
+		}
 	}
 }
