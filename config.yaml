@@ -1,0 +1,13 @@
+server:
+  port: ":8080"
+  backends:
+    - "http://localhost:8081"
+    - "http://localhost:8082"
+    - "http://localhost:8083"
+
+ratelimit:
+  rate: 5.0
+  capacity: 10.0
+
+encryption:
+  key: "0123456789abcdef0123456789abcdef"
