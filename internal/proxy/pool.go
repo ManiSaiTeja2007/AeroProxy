@@ -85,6 +85,17 @@ func (b *Backend) UpdateEWMA(durationMs float64) {
 	}
 }
 
+// EnsureWarmup initializes EWMA to 50ms so new servers aren't overloaded ("too fast").
+// Seeding new backends prevents "0-score bias" where a new server with 0 active requests
+// and 0 EWMA receives 100% of traffic and gets immediately overloaded.
+func (b *Backend) EnsureWarmup() {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	if b.EWMA == 0 {
+		b.EWMA = 50.0 // Warmup value
+	}
+}
+
 // RecordError increments consecutive errors and trips circuit if threshold is reached.
 func (b *Backend) RecordError() {
 	b.mux.Lock()
@@ -140,6 +151,8 @@ func (s *ServerPool) GetNextPeer() *Backend {
 		if !b.IsHealthy() {
 			continue
 		}
+
+		b.EnsureWarmup()
 
 		active := atomic.LoadInt64(&b.ActiveRequests)
 		b.mux.RLock()

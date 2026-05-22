@@ -1,6 +1,6 @@
 module github.com/ManiSaiTeja2007/aeroproxy
 
-go 1.26.3
+go 1.24.0
 
 require (
 	github.com/hashicorp/memberlist v0.5.4

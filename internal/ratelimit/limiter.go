@@ -1,8 +1,8 @@
 package ratelimit
 
 import (
+	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -143,8 +143,12 @@ func (rl *RateLimiter) Allow(ip string) bool {
 // Middleware intercepts HTTP requests and rate limits them based on client IP.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.RemoteAddr, ":")
-		ip := parts[0]
+		// Use net.SplitHostPort to safely handle IPv4 and IPv6
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// Fallback: if port is missing, treat as raw IP
+			ip = r.RemoteAddr
+		}
 
 		if !rl.Allow(ip) {
 			metrics.BlocksTotal.Inc()

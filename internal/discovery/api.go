@@ -17,6 +17,7 @@ type AddBackendRequest struct {
 }
 
 // RegisterDiscoveryAPI wires the POST /backends/add handler to the provided mux.
+// TODO: Production API should be secured via mTLS or shared-secret headers.
 func RegisterDiscoveryAPI(mux *http.ServeMux, pool *proxy.ServerPool) {
 	mux.HandleFunc("/backends/add", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

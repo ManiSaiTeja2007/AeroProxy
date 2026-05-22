@@ -33,6 +33,7 @@ func TestIntegration(t *testing.T) {
 	backendHits := make(map[string]int)
 
 	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
 		mu.Lock()
 		backendHits["server1"]++
 		mu.Unlock()
@@ -42,6 +43,7 @@ func TestIntegration(t *testing.T) {
 	defer server1.Close()
 
 	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
 		mu.Lock()
 		backendHits["server2"]++
 		mu.Unlock()
@@ -51,6 +53,7 @@ func TestIntegration(t *testing.T) {
 	defer server2.Close()
 
 	server3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
 		mu.Lock()
 		backendHits["server3"]++
 		mu.Unlock()
@@ -73,6 +76,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	for _, b := range backends {
+		b := b // Shadow loop variable for closure capture safety
 		proxyHandler := httputil.NewSingleHostReverseProxy(b.URL)
 		originalDirector := proxyHandler.Director
 		proxyHandler.Director = func(req *http.Request) {

@@ -83,6 +83,7 @@ func DataShifterMiddleware(next http.Handler) http.Handler {
 
 		case []interface{}:
 			// Array of elements -> process maps concurrently using goroutines
+			// Safe: Each goroutine operates on a unique map pointer within the slice, preventing concurrent map access panics.
 			var wg sync.WaitGroup
 			for i := range data {
 				item := data[i]

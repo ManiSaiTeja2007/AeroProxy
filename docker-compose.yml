@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   aeroproxy-1:
     build: .

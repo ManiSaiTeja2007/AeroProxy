@@ -91,16 +91,17 @@ func main() {
 			)
 		}
 
-		proxyHandler := httputil.NewSingleHostReverseProxy(serverURL)
+		sURL := serverURL // Shadow for closure capture safety
+		proxyHandler := httputil.NewSingleHostReverseProxy(sURL)
 
 		originalDirector := proxyHandler.Director
 		proxyHandler.Director = func(req *http.Request) {
 			originalDirector(req)
-			req.Host = serverURL.Host
+			req.Host = sURL.Host
 		}
 
 		backend := &proxy.Backend{
-			URL:          serverURL,
+			URL:          sURL,
 			Alive:        true,
 			ReverseProxy: proxyHandler,
 		}

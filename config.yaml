@@ -12,6 +12,7 @@ ratelimit:
   capacity: 10.0
 
 encryption:
+  # WARNING: Production keys MUST be overridden via ENCRYPTION_KEY environment variable.
   key: "0123456789abcdef0123456789abcdef"
 
 cluster:
