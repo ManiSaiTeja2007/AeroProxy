@@ -1,0 +1,73 @@
+services:
+  aeroproxy-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: aeroproxy-1
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+      - "7946:7946/tcp"
+      - "7946:7946/udp"
+    environment:
+      - NODE_NAME=aeroproxy-1
+      - BIND_ADDR=0.0.0.0
+      - CLUSTER_JOIN_ADDRESS=
+    volumes:
+      - ./config.yaml:/config.yaml
+    networks:
+      - aeroproxy-net
+    restart: always
+
+  aeroproxy-2:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: aeroproxy-2
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+      - "7947:7946/tcp"
+      - "7947:7946/udp"
+    environment:
+      - NODE_NAME=aeroproxy-2
+      - BIND_ADDR=0.0.0.0
+      - CLUSTER_JOIN_ADDRESS=aeroproxy-1:7946
+    volumes:
+      - ./config.yaml:/config.yaml
+    networks:
+      - aeroproxy-net
+    depends_on:
+      - aeroproxy-1
+    restart: always
+
+  mock-backend-1:
+    build: ./mock_backend
+    container_name: mock-backend-1
+    environment:
+      - PORT=8080
+      - SERVER_NAME=mock-backend-1
+    networks:
+      - aeroproxy-net
+
+  mock-backend-2:
+    build: ./mock_backend
+    container_name: mock-backend-2
+    environment:
+      - PORT=8080
+      - SERVER_NAME=mock-backend-2
+    networks:
+      - aeroproxy-net
+
+  mock-backend-3:
+    build: ./mock_backend
+    container_name: mock-backend-3
+    environment:
+      - PORT=8080
+      - SERVER_NAME=mock-backend-3
+    networks:
+      - aeroproxy-net
+
+networks:
+  aeroproxy-net:
+    driver: bridge

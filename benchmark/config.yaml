@@ -1,0 +1,22 @@
+log_level: "info"
+
+server:
+  port: ":8080"
+  backends:
+    - "http://mock-backend-1:8080"
+    - "http://mock-backend-2:8080"
+    - "http://mock-backend-3:8080"
+  circuit_breaker_timeout: "3s"
+
+ratelimit:
+  rate: 5.0
+  capacity: 10.0
+
+encryption:
+  key: "0123456789abcdef0123456789abcdef"
+
+cluster:
+  node_name: "aeroproxy-node-1"
+  bind_addr: "0.0.0.0"
+  bind_port: 7946
+  join_address: ""

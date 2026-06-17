@@ -7,29 +7,34 @@ import (
 
 	"github.com/hashicorp/memberlist"
 	"github.com/ManiSaiTeja2007/aeroproxy/internal/logger"
+	"github.com/ManiSaiTeja2007/aeroproxy/internal/proxy"
 	"github.com/ManiSaiTeja2007/aeroproxy/internal/ratelimit"
 	"go.uber.org/zap"
 )
 
-// BlockBroadcast represents an IP block event broadcasted via Gossip.
-type BlockBroadcast struct {
-	IP           string    `json:"ip"`
-	BlockedUntil time.Time `json:"blocked_until"`
+// GossipEvent represents an event broadcasted via Gossip.
+type GossipEvent struct {
+	Action       string    `json:"action"` // "block" or "add_backend"
+	IP           string    `json:"ip,omitempty"`
+	BlockedUntil time.Time `json:"blocked_until,omitempty"`
+	BackendURL   string    `json:"backend_url,omitempty"`
 }
 
 // Invalidates checks if this broadcast invalidates another queued broadcast.
-func (b *BlockBroadcast) Invalidates(other memberlist.Broadcast) bool {
-	if o, ok := other.(*BlockBroadcast); ok {
-		if o.IP == b.IP {
-			return b.BlockedUntil.After(o.BlockedUntil)
+func (e *GossipEvent) Invalidates(other memberlist.Broadcast) bool {
+	if o, ok := other.(*GossipEvent); ok {
+		if o.Action == e.Action && e.Action == "block" {
+			if o.IP == e.IP {
+				return e.BlockedUntil.After(o.BlockedUntil)
+			}
 		}
 	}
 	return false
 }
 
 // Message serializes the broadcast payload.
-func (b *BlockBroadcast) Message() []byte {
-	data, err := json.Marshal(b)
+func (e *GossipEvent) Message() []byte {
+	data, err := json.Marshal(e)
 	if err != nil {
 		return nil
 	}
@@ -37,12 +42,13 @@ func (b *BlockBroadcast) Message() []byte {
 }
 
 // Finished is invoked when the message will no longer be broadcast.
-func (b *BlockBroadcast) Finished() {
+func (e *GossipEvent) Finished() {
 }
 
 // GossipDelegate implements the memberlist.Delegate interface.
 type GossipDelegate struct {
 	Limiter    *ratelimit.RateLimiter
+	Pool       *proxy.ServerPool
 	Broadcasts *memberlist.TransmitLimitedQueue
 }
 
@@ -53,16 +59,43 @@ func (d *GossipDelegate) NodeMeta(limit int) []byte {
 
 // NotifyMsg processes received gossip broadcasts.
 func (d *GossipDelegate) NotifyMsg(msg []byte) {
-	var event BlockBroadcast
+	var event GossipEvent
 	if err := json.Unmarshal(msg, &event); err != nil {
 		logger.Log.Error("Failed to unmarshal received gossip message", zap.Error(err))
 		return
 	}
-	logger.Log.Info("Gossip cluster sync: received remote IP block",
-		zap.String("ip", event.IP),
-		zap.Time("blocked_until", event.BlockedUntil),
-	)
-	d.Limiter.BlockIP(event.IP, event.BlockedUntil)
+	switch event.Action {
+	case "block":
+		logger.Log.Info("Gossip cluster sync: received remote IP block",
+			zap.String("ip", event.IP),
+			zap.Time("blocked_until", event.BlockedUntil),
+		)
+		d.Limiter.BlockIP(event.IP, event.BlockedUntil)
+	case "add_backend":
+		logger.Log.Info("Gossip cluster sync: received remote backend registration",
+			zap.String("url", event.BackendURL),
+		)
+		if d.Pool != nil {
+			alreadyExists := false
+			for _, b := range d.Pool.GetBackends() {
+				if b.URL.String() == event.BackendURL {
+					alreadyExists = true
+					break
+				}
+			}
+			if !alreadyExists {
+				var timeout time.Duration
+				backends := d.Pool.GetBackends()
+				if len(backends) > 0 {
+					timeout = backends[0].TripDuration
+				}
+				_, err := proxy.RegisterBackendURL(d.Pool, event.BackendURL, timeout)
+				if err != nil {
+					logger.Log.Error("Failed to register dynamic backend via gossip sync", zap.String("url", event.BackendURL), zap.Error(err))
+				}
+			}
+		}
+	}
 }
 
 // GetBroadcasts returns user data broadcasts to send.
@@ -108,7 +141,7 @@ type GossipService struct {
 }
 
 // StartGossipService configures, initializes, and starts the gossip membership node.
-func StartGossipService(nodeName string, bindAddr string, bindPort int, joinAddr string, limiter *ratelimit.RateLimiter) (*GossipService, error) {
+func StartGossipService(nodeName string, bindAddr string, bindPort int, joinAddr string, limiter *ratelimit.RateLimiter, pool *proxy.ServerPool) (*GossipService, error) {
 	config := memberlist.DefaultLANConfig()
 	config.Name = nodeName
 	if bindAddr != "" {
@@ -127,6 +160,7 @@ func StartGossipService(nodeName string, bindAddr string, bindPort int, joinAddr
 
 	delegate := &GossipDelegate{
 		Limiter:    limiter,
+		Pool:       pool,
 		Broadcasts: broadcasts,
 	}
 	config.Delegate = delegate
@@ -155,7 +189,8 @@ func StartGossipService(nodeName string, bindAddr string, bindPort int, joinAddr
 	// Register the RateLimiter callback to broadcast events when rate-limited
 	limiter.SetBroadcastCallback(func(ip string, blockedUntil time.Time) {
 		logger.Log.Info("Queueing IP block broadcast to gossip cluster", zap.String("ip", ip))
-		broadcasts.QueueBroadcast(&BlockBroadcast{
+		broadcasts.QueueBroadcast(&GossipEvent{
+			Action:       "block",
 			IP:           ip,
 			BlockedUntil: blockedUntil,
 		})
@@ -179,4 +214,15 @@ func (g *GossipService) Shutdown() error {
 		return g.list.Shutdown()
 	}
 	return nil
+}
+
+// BroadcastBackendAdd broadcasts a backend addition event to the cluster.
+func (g *GossipService) BroadcastBackendAdd(url string) {
+	if g.broadcasts != nil {
+		logger.Log.Info("Queueing backend add broadcast to gossip cluster", zap.String("url", url))
+		g.broadcasts.QueueBroadcast(&GossipEvent{
+			Action:     "add_backend",
+			BackendURL: url,
+		})
+	}
 }

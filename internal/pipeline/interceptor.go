@@ -63,6 +63,20 @@ func DataShifterMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Fast-path: check if bodyBytes contains sensitive keys. If not, bypass parsing.
+		hasSensitive := false
+		for k := range sensitiveKeys {
+			if bytes.Contains(bodyBytes, []byte(`"`+k+`"`)) {
+				hasSensitive = true
+				break
+			}
+		}
+		if !hasSensitive {
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		var parsed interface{}
 		if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
 			// Graceful Fallback: not valid JSON, proceed as is
@@ -82,20 +96,28 @@ func DataShifterMiddleware(next http.Handler) http.Handler {
 			mutated = true
 
 		case []interface{}:
-			// Array of elements -> process maps concurrently using goroutines
-			// Safe: Each goroutine operates on a unique map pointer within the slice, preventing concurrent map access panics.
-			var wg sync.WaitGroup
-			for i := range data {
-				item := data[i]
-				if m, ok := item.(map[string]interface{}); ok {
-					wg.Add(1)
-					go func(mMap map[string]interface{}) {
-						defer wg.Done()
-						encryptMap(mMap, key)
-					}(m)
+			if len(data) < 20 {
+				// Process small slices synchronously to avoid goroutine overhead
+				for _, item := range data {
+					if m, ok := item.(map[string]interface{}); ok {
+						encryptMap(m, key)
+					}
 				}
+			} else {
+				// Process larger slices concurrently
+				var wg sync.WaitGroup
+				for i := range data {
+					item := data[i]
+					if m, ok := item.(map[string]interface{}); ok {
+						wg.Add(1)
+						go func(mMap map[string]interface{}) {
+							defer wg.Done()
+							encryptMap(mMap, key)
+						}(m)
+					}
+				}
+				wg.Wait()
 			}
-			wg.Wait()
 			mutated = true
 		}
 

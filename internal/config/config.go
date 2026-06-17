@@ -8,8 +8,9 @@ import (
 
 // ServerConfig tracks the gateway port and downstream backends.
 type ServerConfig struct {
-	Port     string   `mapstructure:"port"`
-	Backends []string `mapstructure:"backends"`
+	Port                  string   `mapstructure:"port"`
+	Backends              []string `mapstructure:"backends"`
+	CircuitBreakerTimeout string   `mapstructure:"circuit_breaker_timeout"`
 }
 
 // RateLimitConfig contains token bucket rate limiting parameters.
@@ -53,6 +54,7 @@ func LoadConfig(path string) (*Config, error) {
 		"http://localhost:8082",
 		"http://localhost:8083",
 	})
+	v.SetDefault("server.circuit_breaker_timeout", "30s")
 	v.SetDefault("ratelimit.rate", 5.0)
 	v.SetDefault("ratelimit.capacity", 10.0)
 	v.SetDefault("encryption.key", "0123456789abcdef0123456789abcdef")

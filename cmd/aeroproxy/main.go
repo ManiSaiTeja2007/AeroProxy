@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -58,6 +56,7 @@ func main() {
 		cfg.Cluster.BindPort,
 		cfg.Cluster.JoinAddress,
 		limiter,
+		pool,
 	)
 	if err != nil {
 		logger.Log.Fatal("Failed to start Gossip Service", zap.Error(err))
@@ -67,7 +66,11 @@ func main() {
 	mgmtMux := http.NewServeMux()
 	metrics.InitMetrics()
 	mgmtMux.Handle("/metrics", promhttp.Handler())
-	discovery.RegisterDiscoveryAPI(mgmtMux, pool)
+	discovery.RegisterDiscoveryAPI(mgmtMux, pool, func(url string) {
+		if gossipService != nil {
+			gossipService.BroadcastBackendAdd(url)
+		}
+	})
 
 	mgmtServer := &http.Server{
 		Addr:    ":9090",
@@ -81,38 +84,21 @@ func main() {
 		}
 	}()
 
+	breakerTimeout, err := time.ParseDuration(cfg.Server.CircuitBreakerTimeout)
+	if err != nil {
+		logger.Log.Warn("Invalid circuit_breaker_timeout configuration, falling back to 30s", zap.String("timeout", cfg.Server.CircuitBreakerTimeout), zap.Error(err))
+		breakerTimeout = 30 * time.Second
+	}
+
 	// Load initial backends from configuration
 	for _, rawURL := range cfg.Server.Backends {
-		serverURL, err := url.Parse(rawURL)
+		_, err := proxy.RegisterBackendURL(pool, rawURL, breakerTimeout)
 		if err != nil {
-			logger.Log.Fatal("Failed to parse backend URL",
+			logger.Log.Fatal("Failed to register initial backend URL",
 				zap.String("url", rawURL),
 				zap.Error(err),
 			)
 		}
-
-		sURL := serverURL // Shadow for closure capture safety
-		proxyHandler := httputil.NewSingleHostReverseProxy(sURL)
-
-		originalDirector := proxyHandler.Director
-		proxyHandler.Director = func(req *http.Request) {
-			originalDirector(req)
-			req.Host = sURL.Host
-		}
-
-		backend := &proxy.Backend{
-			URL:          sURL,
-			Alive:        true,
-			ReverseProxy: proxyHandler,
-		}
-
-		// Inject TrackingTransport
-		proxyHandler.Transport = &proxy.TrackingTransport{
-			Backend:   backend,
-			Transport: http.DefaultTransport,
-		}
-
-		pool.AddBackend(backend)
 		logger.Log.Info("Backend server registered", zap.String("url", rawURL))
 	}
 

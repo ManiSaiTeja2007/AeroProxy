@@ -13,9 +13,22 @@ test:
 
 docker-build:
 	podman build -t aeroproxy:latest .
+	podman image prune -f
 
 cluster-up:
-	podman-compose up --build --scale aeroproxy-2=2
+	podman compose -f benchmark/docker-compose.yml up -d --build
+	podman image prune -f
+
+cluster-down:
+	podman compose -f benchmark/docker-compose.yml down
+	podman image prune -f
+
+benchmark:
+	podman compose -f benchmark/docker-compose.yml up -d --build
+	podman image prune -f
+	go run benchmark/run_benchmarks.go
+	podman compose -f benchmark/docker-compose.yml down
+	podman image prune -f
 
 clean:
 	go clean
